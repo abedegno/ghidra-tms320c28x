@@ -510,6 +510,23 @@ public class SetupF28377D extends GhidraScript {
         {0x3F8000L, 0x3FFFFFL, "BOOT_ROM",   "RX"},
     };
 
+    // EMIF chip-select windows: external memory, present only if the board populates it. Ranges from
+    // C2000Ware 2837xD_*_lnk_cpu{1,2}_far.cmd. Mapped so a call or pointer into one resolves to a named
+    // block rather than "non-existing memory" -- which also makes a stray decode into one easy to spot
+    // (SweepResidualMarks lists flows into EMIF*_CS* blocks for review). CS0n is data-only, reached by
+    // 32-bit pointer; CS2n-CS4n hold program + data. EMIF1 can be owned by either CPU (EMIF1MSEL); the
+    // CPU2 linker files carry no EMIF2 windows, so EMIF2 is CPU1-only.
+    private static final Object[][] EMIF_WINDOWS = {
+        {0x80000000L, 0x8FFFFFFFL, "EMIF1_CS0", "RW"},
+        {0x00100000L, 0x002FFFFFL, "EMIF1_CS2", "RWX"},
+        {0x00300000L, 0x0037FFFFL, "EMIF1_CS3", "RWX"},
+        {0x00380000L, 0x003DFFFFL, "EMIF1_CS4", "RWX"},
+    };
+    private static final Object[][] EMIF_WINDOWS_CPU1_ONLY = {
+        {0x90000000L, 0x9FFFFFFFL, "EMIF2_CS0", "RW"},
+        {0x00002000L, 0x00002FFFL, "EMIF2_CS2", "RWX"},
+    };
+
     @Override
     public void run() throws Exception {
         // CPU core — determines which peripheral frames are visible. Take it from the script argument
@@ -571,6 +588,26 @@ public class SetupF28377D extends GhidraScript {
             } catch (Exception e) { println("skip RAM " + name + ": " + e.getMessage()); }
         }
         println("mapped " + rn + " RAM/ROM regions");
+
+        // 0b'. EMIF external-memory windows, uninitialized, with the same per-region perms.
+        int en = 0;
+        java.util.List<Object[]> emif = new java.util.ArrayList<>(java.util.Arrays.asList(EMIF_WINDOWS));
+        if (isCPU1) emif.addAll(java.util.Arrays.asList(EMIF_WINDOWS_CPU1_ONLY));
+        for (Object[] r : emif) {
+            long base = (Long) r[0], end = (Long) r[1];
+            String name = (String) r[2], perms = (String) r[3];
+            try {
+                ensureRam(name, base, (end - base + 1) * 2);   // word span -> bytes
+                MemoryBlock b = currentProgram.getMemory().getBlock(wAddr(base));
+                if (b != null) {
+                    b.setRead(true);
+                    b.setWrite(perms.indexOf('W') >= 0);
+                    b.setExecute(perms.indexOf('X') >= 0);
+                }
+                createLabel(wAddr(base), name, true, SourceType.USER_DEFINED); en++;
+            } catch (Exception e) { println("skip EMIF " + name + ": " + e.getMessage()); }
+        }
+        println("mapped " + en + " EMIF chip-select windows");
 
         // 0c. Fill flash + OTP the imported image doesn't cover. An image based at 0x82000 omits
         // sector S0 (0x80000-0x81FFF) and any tail past its last word; the CRC table at 0x80010 and S0

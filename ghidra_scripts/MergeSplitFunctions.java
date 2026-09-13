@@ -31,10 +31,20 @@
 // name you applied to the far half survives, and re-running after one changes nothing. Every merge
 // leaves an Analysis bookmark at the seam.
 //
+// PHANTOM REFERENCES, removed first. SeedFunctions' raw call scan adds a call xref wherever two words
+// encode LCR/LC/FFC -- including the operand word of a real instruction and a pair of table cells.
+// Nothing executes from there, and now that the listing is decoded that is checkable: a flow
+// reference whose source is not the start of an instruction is deleted. Each one was propping up a
+// function, usually the far half of a split that (a) would otherwise have merged. A target left with
+// no references that still cannot merge (data, a hand-named function, a stored address) gets an
+// Analysis / c28x-phantom-orphan bookmark saying why; SweepResidualMarks lists those for review.
+// Only USER_DEFINED flow references are touched -- the source SeedFunctions writes.
+//
 // Properties (-Dname=value):
-//   c28x.split.dryRun       (bool, default false) report only; make no changes
-//   c28x.split.rounds       (int,  default 4)     fixpoint cap (a split can chain into another)
-//   c28x.split.allowOwnerRet(bool, default false) drop requirement (d) -- looser, less certain
+//   c28x.split.dryRun        (bool, default false) report only; make no changes
+//   c28x.split.rounds        (int,  default 4)     fixpoint cap (a split can chain into another)
+//   c28x.split.allowOwnerRet (bool, default false) drop requirement (d) -- looser, less certain
+//   c28x.split.keepPhantomRefs(bool, default false) skip the phantom-reference pass
 //
 // @category TMS320C28x
 import ghidra.app.script.GhidraScript;
@@ -44,7 +54,9 @@ import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceManager;
+import ghidra.program.model.symbol.SourceType;
 import java.util.ArrayList;
 import java.util.HashSet;
 
@@ -97,6 +109,22 @@ public class MergeSplitFunctions extends GhidraScript {
         return n.startsWith("FUN_") || n.startsWith("SUB_") || n.startsWith("thunk_FUN_");
     }
 
+    /** A flow xref from somewhere that is not an instruction start: nothing can execute from there. */
+    boolean isPhantom(Reference r) {
+        return r.getReferenceType().isFlow() && r.getSource() == SourceType.USER_DEFINED
+            && currentProgram.getListing().getInstructionAt(r.getFromAddress()) == null;
+    }
+
+    boolean ignorePhantoms = true;
+
+    /** References to `a` that are not phantoms. In a dry run the phantoms are still present. */
+    int realRefCount(Address a) {
+        int n = 0;
+        for (Reference r : currentProgram.getReferenceManager().getReferencesTo(a))
+            if (!ignorePhantoms || !isPhantom(r)) n++;
+        return n;
+    }
+
     @Override
     public void run() throws Exception {
         promoteDashDArgs();
@@ -109,8 +137,26 @@ public class MergeSplitFunctions extends GhidraScript {
         HashSet<Long> vals = imageValues();
         println("32-bit values present in the image: " + vals.size());
 
+        // Pass 0: phantom flow references. Collect first -- deleting while iterating the DB is unsafe.
+        java.util.TreeSet<Address> phantomTargets = new java.util.TreeSet<>();
+        java.util.TreeMap<Address, Address> phantomFrom = new java.util.TreeMap<>();
+        ignorePhantoms = !Boolean.getBoolean("c28x.split.keepPhantomRefs");
+        if (ignorePhantoms) {
+            ArrayList<Reference> phantoms = new ArrayList<>();
+            for (Address from : rm.getReferenceSourceIterator(currentProgram.getMemory(), true))
+                for (Reference r : rm.getReferencesFrom(from))
+                    if (isPhantom(r)) phantoms.add(r);
+            for (Reference r : phantoms) {
+                phantomTargets.add(r.getToAddress());
+                phantomFrom.putIfAbsent(r.getToAddress(), r.getFromAddress());
+                if (!dry) rm.delete(r);
+            }
+            println((dry ? "would delete " : "deleted ") + phantoms.size() + " phantom flow reference(s) to "
+                + phantomTargets.size() + " target(s)");
+        }
+
         int merged = 0, refused = 0;
-        HashSet<Long> refusedAt = new HashSet<>();
+        HashSet<Long> refusedAt = new HashSet<>(), mergedAt = new HashSet<>();
         for (int round = 1; round <= rounds; round++) {
             ArrayList<Function> cands = new ArrayList<>();
             for (Function f : fm.getFunctions(true)) cands.add(f);
@@ -120,7 +166,7 @@ public class MergeSplitFunctions extends GhidraScript {
                 Address entry = f.getEntryPoint();
                 if (fm.getFunctionAt(entry) == null) continue;      // merged away earlier this round
                 if (!defaultNamed(f)) continue;
-                if (rm.getReferenceCountTo(entry) > 0) continue;    // (a) something points at it
+                if (realRefCount(entry) > 0) continue;              // (a) something points at it
                 if (vals.contains(w(entry))) continue;              // (b) a table could hold it
 
                 Instruction prev = getInstructionBefore(entry);
@@ -144,6 +190,7 @@ public class MergeSplitFunctions extends GhidraScript {
                 println(String.format("%s %05x (%d words) into %05x %s", dry ? "would merge" : "merge",
                     w(entry), f.getBody().getNumAddresses() / 2, w(owner.getEntryPoint()),
                     owner.getName()));
+                mergedAt.add(w(entry));
                 if (dry) { merged++; inRound++; continue; }
 
                 AddressSetView body = new AddressSet(owner.getBody()).union(f.getBody());
@@ -169,9 +216,32 @@ public class MergeSplitFunctions extends GhidraScript {
             if (inRound == 0 || dry) break;
         }
 
+        // Phantom targets now referenced by nothing that the rounds above could not merge.
+        int orphans = 0;
+        for (Address t : phantomTargets) {
+            Function f = fm.getFunctionAt(t);
+            if (f == null || mergedAt.contains(w(t)) || realRefCount(t) > 0) continue;
+            Instruction prev = getInstructionBefore(t);
+            boolean onFallThrough = prev != null && t.equals(prev.getFallThrough());
+            Function owner = prev == null ? null : fm.getFunctionContaining(prev.getAddress());
+            String why = !defaultNamed(f)
+                    ? "named by hand" + (onFallThrough ? "; on the fall-through of " + prev.getAddress()
+                        + ", so the real entry may be earlier" : "")
+                : vals.contains(w(t)) ? "its address is stored in the image as a 32-bit value"
+                : !onFallThrough ? "not on a fall-through: data decoded as code, or an entry nothing references"
+                : owner == null ? "the instruction before it is in no function"
+                : "the function before it already returns";
+            orphans++;
+            println(String.format("  orphan %05x %s (%d words): %s", w(t), f.getName(),
+                f.getBody().getNumAddresses() / 2, why));
+            if (!dry) currentProgram.getBookmarkManager().setBookmark(t, "Analysis", "c28x-phantom-orphan",
+                "only reference was a phantom call from " + phantomFrom.get(t) + "; not merged: " + why);
+        }
+
         println("");
         println(merged + " split function(s) " + (dry ? "would be merged" : "merged")
-            + ", " + refused + " refused");
+            + ", " + refused + " refused, " + orphans + " phantom orphan(s)"
+            + (dry || orphans == 0 ? "" : " bookmarked (Analysis / c28x-phantom-orphan)"));
         if (merged > 0 && !dry)
             println("re-run ReachabilityReport: everything those halves called is now reachable"
                 + " through the function that actually contains them.");
