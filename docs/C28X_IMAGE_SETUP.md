@@ -9,16 +9,16 @@ Every step is a script in the **TMS320C28x** Script-Manager category.
 | # | Step | What it does |
 |---|------|--------------|
 | 0 | **Import + set base** | Load the raw `.bin` as `TMS320C28x:LE:32:default` (F28377D) or `…:f2812`. Set the image base to the flash word address the dump starts at. See the byte-swap note. |
-| 1 | `SetupF28377D.java` (or `SetupF2812.java`) | Map the device memory — peripheral MMIO frames **and the on-chip RAM regions**, split into their datasheet banks (`M0`/`M1`, `LS0`…`LS5`, `D0`/`D1`, `GS0-15`, CLA/CPU MSGRAMs) with correct perms (SARAM → **RWX** since ramfuncs run there; ROM → RX; message RAM → RW). Also maps the DCAN `CANA`/`CANB` message RAM (`0x49000`/`0x4b000`) and (CPU1) the uPP message RAM. Mapping RAM is what lets calls into it resolve later. Pass `CPU1` or `CPU2` as the script arg — CPU1 has device-unique peripherals (UPP/XBAR/USBA/DEV_CFG) that only get labeled when the arg matches. |
-| 2 | `SeedFunctions.java` | Recover functions from the bytes (call targets + prologues) and add call-site→target refs. Call targets pass a **boundary gate** so a coincidental word pair inside a numeric table cannot invent a target in the middle of a real instruction. Also recovers `_c_int00` and marks it an entry point — see below. |
+| 1 | `SetupF28377D.java` (or `SetupF2812.java`) | Map the device memory — peripheral MMIO frames **and the on-chip RAM regions**, split into their datasheet banks (`M0`/`M1`, `LS0`…`LS5`, `D0`/`D1`, `GS0-15`, CLA/CPU MSGRAMs) with correct perms (SARAM → **RWX** since ramfuncs run there; ROM → RX; message RAM → RW). Also maps the DCAN `CANA`/`CANB` message RAM (`0x49000`/`0x4b000`), (CPU1) the uPP message RAM, and the EMIF chip-select windows as uninitialized external memory (`EMIF1_CS0`/`CS2`/`CS3`/`CS4`; CPU1 adds `EMIF2_CS0`/`CS2`). Mapping RAM is what lets calls into it resolve later. Pass `CPU1` or `CPU2` as the script arg — CPU1 has device-unique peripherals (UPP/XBAR/USBA/DEV_CFG) that only get labeled when the arg matches. |
+| 2 | `SeedFunctions.java` | Recover functions from the bytes (call targets + prologues) and add call-site→target refs. Call targets pass a **boundary gate** so a coincidental word pair inside a numeric table cannot invent a target in the middle of a real instruction, and so do call **sites**, so an operand word that encodes `FFC`/`LC` cannot invent a call. Also recovers `_c_int00` and marks it an entry point — see below. |
 | 3 | `MarkJumpTables.java`, `MarkDataTables.java` | Mark switch/pointer tables and float-constant pools as data so they stop decoding as garbage. |
 | 4 | `MaterializeSections.java` or `MaterializeCopyTable.java` | Copy the flash **load images** into their RAM **run** addresses so the RAM-resident code/data becomes real. Which one depends on the startup copy mechanism. |
 | 4c | `EmulateStartup.java` | The general alternative to 4/4b: **run the image's own `_c_int00`** and keep the RAM it writes. Covers whatever mechanism the image uses — including the inlined `.cinit` walk that neither materializer implements. Dry run by default. |
 | 4d | `MarkComponentRegistry.java` | Turns the materialized RAM dispatch table into actual call-graph **references**. 4/4b/4c restore the bytes; without this the graph never sees the indirect edges and every handler still looks dead. Finds the table structurally, reads each dispatcher's descriptor field offset out of the code, creates functions at proven call targets, and recovers a dispatcher's own function when nothing calls it either. Sites with no discovered table behind them go to **base resolution** and the **strided-table** walk — see §Step 4d. Idempotent; `-Dc28x.reg.dryRun` to preview. |
 | 5 | `FinalizeRamfuncs.java` | Post-analysis cleanup: rebuild bodies, clear stale flow bookmarks, repair conflicts. Run it **after** analysis has settled. |
-| 5b | `MergeSplitFunctions.java` | Reunite functions step 2 cut in two at a mid-function register push it mistook for a prologue. The far half keeps the `LRETR` and inherits no callers, so it and everything it calls read as dead. See §Step 5b. Idempotent; `-Dc28x.split.dryRun` to preview. |
+| 5b | `MergeSplitFunctions.java` | Reunite functions step 2 cut in two at a mid-function register push it mistook for a prologue. The far half keeps the `LRETR` and inherits no callers, so it and everything it calls read as dead. First deletes phantom call xrefs (source not an instruction start). See §Step 5b. Idempotent; `-Dc28x.split.dryRun` to preview. |
 | 6 | `RetypeWideMemory.java` | Retype 32/64-bit memory operands to kill `CONCAT22`/`CONCAT44` in the decompiler. |
-| 7 | `SweepResidualMarks.java` + verify | Classify leftover `Bad Instruction` marks, delete only the provably cosmetic ones, and confirm against a known-good baseline. **Dry run by default — pass `apply` to delete.** |
+| 7 | `SweepResidualMarks.java` + verify | Go through the bookmarks: delete provably cosmetic `Error` marks and the `c28x-merged-split` notes 5b left, make each `Found Code` site a function, and list everything that looks like a wrong decode. Confirm against a known-good baseline. **Dry run by default — pass `apply`.** |
 | 8 | `ReachabilityReport.java` | What is actually reachable from `_c_int00`, and *why* the rest is not. Run last — it is only as good as the reference graph. |
 
 **Run the steps in the order they are numbered.** This table was for a while listed 5, 5b,
@@ -522,6 +522,22 @@ that provably could not have been whole, and no body became fragmented.
 After this, the unreachable tail is genuinely flat — the largest remaining
 orphan subtree on CPU2 is 38 functions and on CPU1 is 10, against 156 before.
 
+**Phantom call xrefs, deleted first.** Step 2's call scan adds an xref wherever two
+words encode `LCR`/`LC`/`FFC` — including a `B cc` offset, an FPU instruction's second
+word, or two table cells. Rule (1) then refuses the split it props up, and the fake
+target can be data. Once the listing is decoded that is checkable: a USER_DEFINED flow
+xref whose source is not an instruction start is deleted. Targets left unreferenced
+that still cannot merge are bookmarked `c28x-phantom-orphan` with the reason, for
+step 7. `-Dc28x.split.keepPhantomRefs` skips this.
+
+| image | phantom xrefs | merges they unblocked | orphans listed |
+|---|---|---|---|
+| CPU2 image A | 98 | 44 | 20 |
+| CPU2 image B | 55 | 11 | 16 |
+
+Step 2 now gates the call site too, which removes the operand-word class at the source;
+a site inside a data table still gets through, so this pass stays.
+
 ## The CLA — a second program, not a second mode
 
 If the image drives the Control Law Accelerator, the pipeline above will materialize its
@@ -634,12 +650,32 @@ those references resolvable; on the image above that is where 281 of 456 referen
 Unchanged; run last to clean up the decompiler's 32/64-bit reads. See its
 script header.
 
-## Step 7 — Residual-mark cleanup + verification
+## Step 7 — Bookmark sweep + verification
 
 After the pipeline a handful of `Error`/`Bad Instruction` bookmarks usually
 remain. `SweepResidualMarks.java` performs the classification below and deletes only the
-cosmetic class. It is a **dry run by default** — pass `apply` to actually delete. Anything
+cosmetic class. It is a **dry run by default** — pass `apply` to act. Anything
 it cannot prove cosmetic it keeps and prints, so real gaps stay visible.
+
+It also handles two `Analysis` categories:
+
+- **`c28x-merged-split`** — step 5b's note at each seam it merged. Deleted.
+- **`c28x-phantom-orphan`** — a function step 5b left with no references. Listed with the
+  decode checks below; the bookmark is deleted once the function is gone or gains a real
+  reference. The function itself is never deleted.
+- **`Found Code`** — Ghidra's operand-reference analyzer decoded code at an address only a
+  data reference names. Each becomes a function unless the decode fails a check: nothing
+  decodes at the mark, a `TRAP`-class opcode (a small integer read as code), a flow to an
+  address no block maps or into external memory, a fall-through into data, no return or unconditional
+  branch, or a pop/`SUBB SP` before any push/`ADDB SP` (a mid-function entry). A site inside
+  another function is left alone. An existing function is checked, never deleted.
+
+**Decode review list.** In-function and loose `Error` marks, flows to unmapped addresses or into
+an `EMIF*_CS*` window (no image step fills external memory, so it is never an un-materialized
+section), and suspect `Found Code` are printed together with their words and decode, and on `apply`
+bookmarked `Warning` / `c28x-decode-suspect` (replacing the previous run's). Run
+`run_fw_parity` over each before calling it a spec bug: data decoded as code decodes the same
+way in dis2000. For a RAM site, dump the words from the program and pass `-Base` = `-Start`.
 
 Two rules matter more than they look:
 

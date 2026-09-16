@@ -29,7 +29,10 @@
 //   of them. Read-only (PseudoDisassembler), so probing never lays down code. Measured over
 //   2169 distinct targets in two application images: every real target drew at most 2
 //   step-over votes and every mid-instruction target at least 7 — 36 phantoms rejected, 0 real
-//   targets lost. Disable with -Dc28x.seed.noBoundaryGate.
+//   targets lost. The same test gates the call SITE: an operand word inside real code passes the
+//   code-likeness filter and can encode FFC/LC, and its fake xref roots a phantom function. It does
+//   not see a site inside a data table (resynchronization lands on data too); MergeSplitFunctions
+//   deletes those xrefs once the listing is decoded. Disable both with -Dc28x.seed.noBoundaryGate.
 //
 //   (B) PROLOGUE patterns — MEDIUM confidence. C-compiled functions open with callee-saved
 //       pushes / frame setup (MOVL *SP++,XARn = lo8 0xBD; ADDB SP,#N = hi8 0xFE; MOV32
@@ -251,6 +254,7 @@ public class SeedFunctions extends GhidraScript {
         Map<Long,Long> callSiteToTarget = new HashMap<>();   // callSite word -> target word
         Set<Long> phantomOffcut = new TreeSet<>();           // targets refused by the boundary gate
         int phantomSites = 0;                                // sites whose target was refused
+        int phantomSiteCount = 0;                            // sites that are themselves mid-instruction
         for (long wi = 0; wi < nwords - 1; wi++) {
             int w1 = wordAt(wi * 2);
             if (w1 < 0) continue;
@@ -275,6 +279,16 @@ public class SeedFunctions extends GhidraScript {
             // F28377D image: 7 halt_baddata stubs seeded into the const-table region, four
             // of them carrying fake call xrefs from other data words.)
             if (!noDataFilter && !looksLikeCode(base + wi, window, maxEntropy, minCodeFrac)) continue;
+            // SITE GATE: the same test, applied to the call site. The code-likeness window cannot
+            // reject an operand word -- it sits in real code -- and a `B cc` offset or an FPU
+            // instruction's second word often encodes FFC/LC + an in-image address. Its fake xref
+            // then roots a phantom function, frequently in the middle of a real one. Measured on an
+            // F28377D application image: 231 sites refused (209 operand words, 22 in data), none of
+            // them a real call once the image is analyzed.
+            if (!noBoundaryGate && !isInstructionBoundary(base + wi)) {
+                phantomSiteCount++;
+                continue;
+            }
             // BOUNDARY GATE: refuse a target that sits INSIDE an instruction (see the header).
             // The site's reference is dropped with it -- a "call" to a mid-instruction address
             // is phantom by construction, and injecting the xref anyway would let a later
@@ -605,6 +619,8 @@ public class SeedFunctions extends GhidraScript {
             println(String.format("boundary gate: refused %d phantom targets landing mid-instruction "
                 + "(from %d call/branch sites; backoff=%d, votes>=%d)",
                 phantomOffcut.size(), phantomSites, boundaryBackoff, boundaryVotes));
+            println(String.format("site gate: refused %d call/branch sites that sit mid-instruction",
+                phantomSiteCount));
             int shown = 0;
             for (long t : phantomOffcut) {
                 if (shown++ >= 20) { println(String.format("  ... and %d more", phantomOffcut.size() - 20)); break; }
